@@ -2199,6 +2199,30 @@ The
 parameter tells the underlying database that it can store changes without
 performing a full flush after each change. This may improve performance
 for the consumer, while sacrificing safety or durability.
+
+When
+.B multiprovider
+is enabled, conflict resolution uses the
+.B entryCSN
+total order: the newest CSN wins. If an older modify arrives after a newer one,
+unchanged attributes from the older modification are merged; an incoming add,
+delete, or rename whose CSN is not newer than the local entry is ignored. This
+is the same deterministic decision on every replica and does not depend on
+network arrival order.
+
+Every applied change and every conflict decision emits a
+.B syncrepl audit:
+record in the sync debug log. The record includes the rid, operation, target
+DN, result, incoming CSN, and local CSN. Configure the
+.BR slapo-accesslog (5)
+overlay as well when a persistent, searchable audit database is required.
+
+Syncrepl resumes from the cookie stored in the context entry.
+Configure
+.B syncprov-checkpoint
+on every multiprovider node to bound the replay window after an unclean
+shutdown. Replayed operations are safe because the replicatee compares their
+CSN with the current entry before applying them.
 .RE
 .TP
 .B olcUpdateDN: <dn>

@@ -23,6 +23,62 @@ recovery time after an unclean shutdown.
 
 On databases that support inequality indexing, it is highly recommended to set an
 eq index on the entryCSN attribute when using this overlay.
+.SH ACTIVE/ACTIVE CONFLICT RESOLUTION
+When
+.B syncrepl
+is used in a multiprovider (mirror mode or MMR) configuration, every replicated
+write carries an
+.B entryCSN
+that is ordered by timestamp, change counter, server ID, and modification
+counter. The newer CSN always wins, so all replicas choose the same winner
+regardless of the order in which the operations arrive.
+
+Adds, modifies, deletes, and renames use the same rule. A replayed operation
+with a CSN that is not newer than the local entry is ignored. For an older
+modify that arrives after a newer modify, the attributes touched by the newer
+operation are retained and non-conflicting attribute changes are merged. This
+attribute-level merge makes active/active convergence possible without losing
+independent changes to other attributes. For concurrent adds of the same DN,
+the entry from the Add with the winning CSN replaces the local entry and any
+attributes that exist only in the losing entry are removed.
+
+Conflict decisions and the application of replicated changes are written to the
+sync debug log in a stable, searchable form:
+.PP
+.nf
+syncrepl audit: rid=001 op=modify dn="cn=user,dc=example,dc=com" \\
+  result=conflict-local-wins csn=... localCSN=...
+.fi
+.PP
+The result values are
+.BR change-applied ,
+.BR conflict-incoming-wins ,
+.BR conflict-local-wins ,
+.BR conflict-merge-local-newer ,
+.BR conflict-duplicate ,
+and
+.BR resume-state-saved .
+For a persistent, queryable audit trail of successful and failed writes, use
+.BR slapo-accesslog (5)
+on every provider and point
+.B syncprov-sessionlog-source
+at that log database.
+
+The syncrepl cookie is derived from
+.B contextCSN
+and is used to resume a refresh after a disconnect or process restart. On an
+active/active node, configure
+.B syncprov-checkpoint
+so that the contextCSN is persisted regularly. For a small recovery window,
+for example:
+.PP
+.nf
+syncprov-checkpoint 1 1
+.fi
+.PP
+This checkpoints after every operation or one minute, whichever comes first.
+The cookie is idempotent: a crash can cause a change to be replayed, but the
+CSN check prevents the replay from overwriting a newer local value.
 .SH CONFIGURATION
 These
 .B slapd.conf

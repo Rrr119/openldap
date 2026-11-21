@@ -24,3 +24,10 @@ import pytest
 
 from .slapd import temp, server_factory, server
 from .backends import db
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "mmr(...): configure a multiprovider test topology")
+    config.addinivalue_line(
+        "markers", "db(name): select the test database backend")

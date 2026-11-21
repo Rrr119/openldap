@@ -25,7 +25,7 @@ import logging
 import os
 import pathlib
 import pytest
-import subprocess
+import time
 
 
 from .slapd import server
@@ -66,7 +66,9 @@ def replica(request, server_factory, provider):
 @pytest.fixture(scope="class")
 def mmr(request, server_factory):
     mmr_marker = request.node.get_closest_marker("mmr")
-    mmr_args = mmr_marker and mmr_marker.args or {}
+    mmr_args = dict(mmr_marker.kwargs) if mmr_marker else {}
+    if mmr_marker and mmr_marker.args and isinstance(mmr_marker.args[0], dict):
+        mmr_args.update(mmr_marker.args[0])
     server_count = mmr_args.get("mmr", 4)
     serverids = mmr_args.get("serverids", range(1, server_count+1))
     server_connections = mmr_args.get("connections") or \
@@ -94,6 +96,7 @@ def mmr(request, server_factory):
 
         db = db_class(server, "dc=example,dc=com")
         syncprov = Syncprov(db)
+        server.syncprov = syncprov
 
     for serverid, server in servers.items():
         suffix = db.suffix
@@ -124,11 +127,51 @@ def mmr(request, server_factory):
 # directly.
 # We should even wrap this in a class to allow finer grained control
 # over the behaviour like waiting for partial syncs etc.
+def wait_until(predicate, timeout=30, interval=0.2):
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        try:
+            last = predicate()
+            if last:
+                return last
+        except ldap.LDAPError as exc:
+            last = exc
+        time.sleep(interval)
+    raise AssertionError(f"condition not met within {timeout}s: {last!r}")
+
+
+def search_one(server, dn, attrs, base_dn=None, scope=ldap.SCOPE_BASE,
+               rootdn=None, secret=None):
+    conn = server.connect()
+    try:
+        if rootdn is not None:
+            conn.simple_bind_s(rootdn, secret)
+        result = conn.search_s(dn, scope, "(objectClass=*)", attrs)
+    finally:
+        conn.unbind_s()
+    return result[0] if result else (None, None)
+
+
 def wait_for_resync(searchbase, servers, timeout=30):
-    subprocess.check_call(["synccheck", "-p", "--base", searchbase,
-                           "--timeout", str(timeout),
-                           *[str(server.uri) for server in servers],
-                           ], timeout=timeout+5)
+    def snapshots():
+        result = []
+        for server in servers:
+            conn = server.connect()
+            try:
+                entries = conn.search_s(searchbase, ldap.SCOPE_SUBTREE,
+                                        "(objectClass=*)",
+                                        ["entryCSN", "entryUUID"])
+            finally:
+                conn.unbind_s()
+            result.append({dn: attrs for dn, attrs in entries if dn})
+        return result
+
+    def consistent():
+        result = snapshots()
+        return all(snapshot == result[0] for snapshot in result[1:])
+
+    wait_until(consistent, timeout=timeout)
 
 
 def test_mmr(mmr):

@@ -1253,6 +1253,151 @@ compare_csns( struct sync_cookie *sc1, struct sync_cookie *sc2, int *which )
 	return match;
 }
 
+#define SYNC_CONFLICT_LOCAL_WINS	-1
+#define SYNC_CONFLICT_DUPLICATE		0
+#define SYNC_CONFLICT_INCOMING_WINS	1
+#define SYNC_CONFLICT_NO_LOCAL_CSN	2
+
+static int
+syncrepl_csn_compare( struct berval *incoming, struct berval *local )
+{
+	int match = 0;
+	const char *text = NULL;
+
+	if ( incoming == NULL || local == NULL ||
+		BER_BVISNULL( incoming ) || BER_BVISNULL( local ) ) {
+		return SYNC_CONFLICT_NO_LOCAL_CSN;
+	}
+
+	value_match( &match, slap_schema.si_ad_entryCSN,
+		slap_schema.si_ad_entryCSN->ad_type->sat_ordering,
+		SLAP_MR_VALUE_OF_ATTRIBUTE_SYNTAX,
+		incoming, local, &text );
+
+	return match;
+}
+
+static void
+syncrepl_audit( syncinfo_t *si, Operation *op, const char *operation,
+	const char *result, struct berval *csn, struct berval *local )
+{
+	const char *dn = "-";
+
+	if ( op && !BER_BVISNULL( &op->o_req_dn )) {
+		dn = op->o_req_dn.bv_val;
+	}
+
+	Debug( LDAP_DEBUG_SYNC,
+		"syncrepl audit: %s op=%s dn=\"%s\" result=%s csn=%s localCSN=%s\n",
+		si->si_ridtxt, operation, dn, result,
+		csn == NULL || BER_BVISNULL( csn ) ? "-" : csn->bv_val,
+		local == NULL || BER_BVISNULL( local ) ? "-" : local->bv_val );
+}
+
+/*
+ * Resolve an incoming entry-changing operation against the local entryCSN.
+ * entryCSN is the total order used for replication conflicts: the newer CSN
+ * always wins.  The CSN's timestamp, change counter, server id, and final
+ * counter make the order total, so every replica reaches the same answer for
+ * the same pair of writes independent of message arrival order.
+ */
+static int
+syncrepl_entry_conflict( syncinfo_t *si, Operation *op, const char *operation )
+{
+	BerVarray vals = NULL;
+	int rc, match;
+
+	if ( !SLAP_MULTIPROVIDER( op->o_bd ) || BER_BVISNULL( &op->o_csn )) {
+		return SYNC_CONFLICT_NO_LOCAL_CSN;
+	}
+
+	rc = backend_attribute( op, NULL, &op->o_req_ndn,
+		slap_schema.si_ad_entryCSN, &vals, ACL_READ );
+	if ( rc != LDAP_SUCCESS || vals == NULL || BER_BVISNULL( vals )) {
+		if ( vals ) {
+			ber_bvarray_free_x( vals, op->o_tmpmemctx );
+		}
+		return SYNC_CONFLICT_NO_LOCAL_CSN;
+	}
+
+	match = syncrepl_csn_compare( &op->o_csn, &vals[0] );
+	switch ( match ) {
+	case SYNC_CONFLICT_LOCAL_WINS:
+		syncrepl_audit( si, op, operation, "conflict-local-wins",
+			&op->o_csn, &vals[0] );
+		break;
+	case SYNC_CONFLICT_DUPLICATE:
+		syncrepl_audit( si, op, operation, "conflict-duplicate",
+			&op->o_csn, &vals[0] );
+		break;
+	case SYNC_CONFLICT_INCOMING_WINS:
+		syncrepl_audit( si, op, operation, "conflict-incoming-wins",
+			&op->o_csn, &vals[0] );
+		break;
+	default:
+		break;
+	}
+
+	ber_bvarray_free_x( vals, op->o_tmpmemctx );
+	return match;
+}
+
+/*
+ * Build a complete replacement for the local entry from an incoming Add.
+ * Every attribute in the winning Add is replaced, and attributes that only
+ * exist locally are removed.  This gives add/add conflicts the same
+ * whole-entry winner as a normal last-writer-wins operation.
+ */
+static Modifications *
+syncrepl_add_conflict_mods( Entry *old, Entry *new, int is_ctx )
+{
+	Modifications *head = NULL, **tail = &head, *mod;
+	Attribute *a;
+
+	for ( a = new->e_attrs; a; a = a->a_next ) {
+		int i;
+
+		if ( is_ctx && a->a_desc == slap_schema.si_ad_contextCSN )
+			continue;
+
+		mod = (Modifications *) ch_calloc( 1, sizeof( Modifications ));
+		mod->sml_op = LDAP_MOD_REPLACE;
+		mod->sml_desc = a->a_desc;
+		mod->sml_type = a->a_desc->ad_cname;
+		mod->sml_numvals = a->a_numvals;
+		mod->sml_values = (BerVarray) ch_calloc(
+			a->a_numvals + 1, sizeof( struct berval ));
+		for ( i = 0; i < a->a_numvals; i++ )
+			ber_dupbv( &mod->sml_values[i], &a->a_vals[i] );
+
+		if ( a->a_nvals ) {
+			mod->sml_nvalues = (BerVarray) ch_calloc(
+				a->a_numvals + 1, sizeof( struct berval ));
+			for ( i = 0; i < a->a_numvals; i++ )
+				ber_dupbv( &mod->sml_nvalues[i], &a->a_nvals[i] );
+		}
+
+		*tail = mod;
+		tail = &mod->sml_next;
+	}
+
+	for ( a = old->e_attrs; a; a = a->a_next ) {
+		if ( is_ctx && a->a_desc == slap_schema.si_ad_contextCSN )
+			continue;
+		if ( attr_find( new->e_attrs, a->a_desc ))
+			continue;
+
+		mod = (Modifications *) ch_calloc( 1, sizeof( Modifications ));
+		mod->sml_op = LDAP_MOD_DELETE;
+		mod->sml_desc = a->a_desc;
+		mod->sml_type = a->a_desc->ad_cname;
+		*tail = mod;
+		tail = &mod->sml_next;
+	}
+
+	return head;
+}
+
 #define CV_CSN_OK	0
 #define CV_CSN_OLD	1
 #define CV_SID_NEW	2
@@ -3003,6 +3148,13 @@ syncrepl_op_modify( Operation *op, SlapReply *rs )
 			/* no entryCSN? shouldn't happen. assume mod is newer. */
 			match = 1;
 		}
+		if ( match <= 0 ) {
+			syncrepl_audit( si, op, "modify",
+				match < 0 ? "conflict-merge-local-newer" :
+					"conflict-duplicate",
+				&mod->sml_nvalues[0],
+				a ? &a->a_nvals[0] : NULL );
+		}
 		e_dup = entry_dup( e );
 		overlay_entry_release_ov( op, e, 0, on );
 	} else {
@@ -3203,6 +3355,9 @@ syncrepl_message_to_op(
 	int		rc, deleteOldRdn = 0, freeReqDn = 0;
 	int		do_graduate = 0, do_unlock = 0;
 	unsigned long changenum = 0;
+	const char *operation = "unknown";
+	int conflict;
+	int add_conflict = SYNC_CONFLICT_NO_LOCAL_CSN;
 
 	if ( ldap_msgtype( msg ) != LDAP_RES_SEARCH_ENTRY ) {
 		Debug( LDAP_DEBUG_ANY, "syncrepl_message_to_op: %s "
@@ -3333,6 +3488,17 @@ syncrepl_message_to_op(
 		goto done;
 	}
 
+	/*
+	 * Delta-sync can replay an entry-changing operation after a link
+	 * outage.  Compare its CSN with the local entry before handing it to
+	 * the backend, so every operation type follows the same deterministic
+	 * last-writer-wins rule.
+	 */
+	operation = op->o_tag == LDAP_REQ_ADD ? "add" :
+		op->o_tag == LDAP_REQ_MODIFY ? "modify" :
+		op->o_tag == LDAP_REQ_MODRDN ? "modrdn" :
+		op->o_tag == LDAP_REQ_DELETE ? "delete" : "unknown";
+
 	if ( do_lock ) {
 		if (( rc = get_pmutex( si )))
 			goto done;
@@ -3350,6 +3516,16 @@ syncrepl_message_to_op(
 	case LDAP_REQ_MODIFY:
 		/* If we didn't get required data, bail */
 		if ( !modlist ) goto done;
+
+		if ( op->o_tag == LDAP_REQ_ADD &&
+			si->si_syncdata == SYNCDATA_ACCESSLOG ) {
+			add_conflict = syncrepl_entry_conflict( si, op, operation );
+			if ( add_conflict == SYNC_CONFLICT_LOCAL_WINS ||
+				add_conflict == SYNC_CONFLICT_DUPLICATE ) {
+				rc = LDAP_SUCCESS;
+				goto done;
+			}
+		}
 
 		rc = slap_mods_check( op, modlist, &text, txtbuf, textlen, NULL );
 
@@ -3370,6 +3546,41 @@ syncrepl_message_to_op(
 				Debug( LDAP_DEBUG_ANY, "syncrepl_message_to_op: %s "
 				"mods2entry (%s)\n",
 					si->si_ridtxt, text );
+			} else if ( add_conflict == SYNC_CONFLICT_INCOMING_WINS ) {
+				Entry *old = NULL;
+
+				rc = be_entry_get_rw( op, &op->o_req_ndn,
+					NULL, NULL, 0, &old );
+				if ( rc == LDAP_SUCCESS ) {
+					Modifications *diff = NULL;
+					int is_ctx = dn_match( &op->o_req_ndn,
+						&op->o_bd->be_nsuffix[0] );
+
+					diff = syncrepl_add_conflict_mods(
+						old, e, is_ctx );
+					op->o_tag = LDAP_REQ_MODIFY;
+					op->orm_modlist = diff;
+					op->orm_no_opattrs = 1;
+					rc = op->o_bd->be_modify( op, &rs );
+					op->orm_no_opattrs = 0;
+					op->orm_modlist = NULL;
+					op->o_tag = LDAP_REQ_ADD;
+					op->ora_e = e;
+					be_entry_release_rw( op, old, 0 );
+					slap_mods_free( diff, 1 );
+					do_graduate = 0;
+					Debug( rc ? LDAP_DEBUG_ANY : LDAP_DEBUG_SYNC,
+						"syncrepl_message_to_op: %s "
+						"be_modify (add conflict) %s (%d)\n",
+						si->si_ridtxt, op->o_req_dn.bv_val, rc );
+				} else {
+					rc = op->o_bd->be_add( op, &rs );
+					do_graduate = 0;
+					Debug( rc ? LDAP_DEBUG_ANY : LDAP_DEBUG_SYNC,
+						"syncrepl_message_to_op: %s be_add "
+						"(conflict fallback) %s (%d)\n",
+						si->si_ridtxt, op->o_req_dn.bv_val, rc );
+				}
 			} else {
 				rc = op->o_bd->be_add( op, &rs );
 				Debug( LDAP_DEBUG_SYNC,
@@ -3414,6 +3625,15 @@ syncrepl_message_to_op(
 		break;
 	case LDAP_REQ_MODRDN:
 		if ( BER_BVISNULL( &rdn ) ) goto done;
+
+		if ( SLAP_MULTIPROVIDER( op->o_bd )) {
+			conflict = syncrepl_entry_conflict( si, op, operation );
+			if ( conflict == SYNC_CONFLICT_LOCAL_WINS ||
+				conflict == SYNC_CONFLICT_DUPLICATE ) {
+				rc = LDAP_SUCCESS;
+				goto done;
+			}
+		}
 
 		if ( rdnPretty( NULL, &rdn, &prdn, NULL ) ) {
 			goto done;
@@ -3465,6 +3685,14 @@ syncrepl_message_to_op(
 		do_graduate = 0;
 		break;
 	case LDAP_REQ_DELETE:
+		if ( SLAP_MULTIPROVIDER( op->o_bd )) {
+			conflict = syncrepl_entry_conflict( si, op, operation );
+			if ( conflict == SYNC_CONFLICT_LOCAL_WINS ) {
+				rc = LDAP_SUCCESS;
+				goto done;
+			}
+		}
+
 		rc = op->o_bd->be_delete( op, &rs );
 		Debug( rc ? LDAP_DEBUG_ANY : LDAP_DEBUG_SYNC,
 			"syncrepl_message_to_op: %s be_delete %s (%d)\n", 
@@ -3474,6 +3702,10 @@ syncrepl_message_to_op(
 			rc = LDAP_SUCCESS;
 		do_graduate = 0;
 		break;
+	}
+	if ( rc == LDAP_SUCCESS ) {
+		syncrepl_audit( si, op, operation, "change-applied",
+			&op->o_csn, NULL );
 	}
 	if ( si->si_syncdata == SYNCDATA_CHANGELOG && !rc )
 		si->si_lastchange = changenum;
@@ -4863,6 +5095,7 @@ retry_modrdn:;
 	case LDAP_SYNC_DELETE :
 		if ( !BER_BVISNULL( &dni.dn ) ) {
 			SlapReply	rs_delete = {REP_RESULT};
+			int		conflict;
 			op->o_req_dn = dni.dn;
 			op->o_req_ndn = dni.ndn;
 			op->o_tag = LDAP_REQ_DELETE;
@@ -4870,6 +5103,17 @@ retry_modrdn:;
 			if ( !syncCSN && si->si_syncCookie.ctxcsn ) {
 				slap_queue_csn( op, si->si_syncCookie.ctxcsn );
 				csn_queued = 1;
+			}
+			conflict = syncCSN ?
+				syncrepl_entry_conflict( si, op, "delete" ) :
+				SYNC_CONFLICT_NO_LOCAL_CSN;
+			if ( conflict == SYNC_CONFLICT_LOCAL_WINS ) {
+				slap_graduate_commit_csn( op );
+				BER_BVZERO( &op->o_csn );
+				syncCSN = NULL;
+				rc = LDAP_SUCCESS;
+				op->o_bd = be;
+				goto done;
 			}
 			rc = op->o_bd->be_delete( op, &rs_delete );
 			Debug( LDAP_DEBUG_SYNC,
@@ -5594,6 +5838,8 @@ syncrepl_updateCookie(
 
 		si->si_cookieState->cs_age++;
 		si->si_cookieAge = si->si_cookieState->cs_age;
+		syncrepl_audit( si, op, "cookie", "resume-state-saved",
+			&first, NULL );
 	} else {
 		Debug( LDAP_DEBUG_ANY,
 			"syncrepl_updateCookie: %s be_modify failed (%d)\n",
@@ -6121,6 +6367,13 @@ dn_callback(
 									rs->sr_entry->e_name.bv_val,
 									old->a_vals[0].bv_val,
 									new->a_vals[0].bv_val );
+								{
+									Operation audit_op = *op;
+									audit_op.o_req_dn = rs->sr_entry->e_name;
+									syncrepl_audit( dni->si, &audit_op, "entry",
+										"conflict-local-wins",
+										&new->a_nvals[0], &old->a_nvals[0] );
+								}
 								return LDAP_SUCCESS;
 							} else if ( rc == 0 ) {
 								Debug( LDAP_DEBUG_SYNC,
@@ -6128,6 +6381,13 @@ dn_callback(
 									"%s %s\n",
 									rs->sr_entry->e_name.bv_val,
 									old->a_vals[0].bv_val );
+								{
+									Operation audit_op = *op;
+									audit_op.o_req_dn = rs->sr_entry->e_name;
+									syncrepl_audit( dni->si, &audit_op, "entry",
+										"conflict-duplicate",
+										&new->a_nvals[0], &old->a_nvals[0] );
+								}
 								return LDAP_SUCCESS;
 							}
 							memcpy( dni->oldcsn, old->a_nvals[0].bv_val,

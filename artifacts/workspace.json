@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid31487",
+  "B": "/home/dev/feedback/uid31487",
+  "sha": "f874dcc5157450d6906968ab89d179f6ba41e79f",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "openldap",
+    "repo": "openldap",
+    "sha": "f874dcc5157450d6906968ab89d179f6ba41e79f"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "openldap",
+    "cloneUrl": "https://github.com/Rrr119/openldap.git"
+  },
+  "at": "2026-11-21T08:40:30.990Z"
+}
